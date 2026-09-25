@@ -14,6 +14,12 @@
 /* Copyable pcapng custom string option, using PEN_WIRESHARK. The prefix
  * identifies the schema independently of other options using that PEN.
  * Each option is a snapshot of one related URL_REQUEST, not byte ownership.
+ * The prefix is followed by a UTF-8 JSON object containing integer source_id
+ * and transport_source_id, the optional attributes listed below, and optional
+ * nak_source_id identifying the source of an inherited anonymization key.
+ * The history array holds changed attributes with event, event_index (zero
+ * based), phase, and time (the original NetLog tick string). A true truncated
+ * flag indicates that attributes or history exceeded the size limits.
  */
 #define NETLOG_REQUEST_OPTION_PREFIX "netlog.request.v1:"
 

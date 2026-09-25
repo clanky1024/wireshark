@@ -147,6 +147,14 @@ The following features are either new or have been significantly updated since v
   "User name" column, and can be used through the "Process" conversation
   filter.
 
+* Chromium NetLog captures now expose related request contexts as `netlog.request`
+  fields, including initiator, priority, network isolation and anonymization keys,
+  URL, method, request type, site-for-cookies, load flags, and upload ID when logged.
+  The fields are included in TShark JSON output and preserved when saving as pcapng.
+  Requests sharing a transport retain separate contexts; these associations do
+  not imply that every byte in a packet belongs to each related request.
+  Use `tshark -T json --no-duplicate-keys` to retain repeated contexts as arrays.
+
 * The Windows installers now ship with Npcap 1.88.
   They previously shipped with Npcap 1.83.
 
