@@ -20,15 +20,18 @@
 #include "netlog.h"
 
 #include <string.h>
+#include <errno.h>
 
 #include "wtap_module.h"
 #include "file_wrappers.h"
+#include "pcapng_module.h"
 
 /* Grab constants for generating supporting layers */
 #include <epan/dissectors/packet-tcp.h>
 #include <epan/iana-info.h>
 
 #include <wsutil/wsjson.h>
+#include <wsutil/json_dumper.h>
 
 /* This is to avoid having large files overload the JSON parser. Adjust as appropriate. */
 #define MAX_FILE_SIZE (1024*1024*1024)
@@ -107,6 +110,7 @@ typedef struct {
     uint32_t offset;
     uint32_t length;
     TransportSession session;
+    GPtrArray *request_options;
 } JSONPacket;
 
 typedef struct {
@@ -424,6 +428,15 @@ static bool netlog_read_packet(const wtap* wth, wtap_rec* rec, GHashTable *json_
     /* Now that we have the TCP/UDP packet's payload, let's build the packet */
 
     bool result = generate_packet(wth, rec, &json_packet->session, payload, payload_len);
+    if (result && json_packet->request_options) {
+        for (unsigned i = 0; i < json_packet->request_options->len; i++) {
+            GBytes *bytes = g_ptr_array_index(json_packet->request_options, i);
+            size_t length;
+            const char *option = g_bytes_get_data(bytes, &length);
+            wtap_block_add_custom_string_option(rec->block, OPT_CUSTOM_STR_COPY,
+                PEN_WIRESHARK, option, length - 1);
+        }
+    }
     g_free(payload);
     g_free(json_tokens);
     g_free(filebuf);
@@ -699,6 +712,454 @@ static bool parse_json_events(char* filebuf, const NetLogEventConstants netlog_e
     return true;
 }
 
+/* Request contexts are independent of the synthesized transport packets. Only
+ * explicit NetLog bindings connect them. In particular, shared DNS jobs,
+ * controllers (which can race several jobs), and CREATED_BY relationships must
+ * not turn into request ownership of a socket.
+ */
+#define NETLOG_FIELD_NAME(name, label) #name,
+static const char *netlog_string_fields[] = { NETLOG_REQUEST_STRING_FIELDS(NETLOG_FIELD_NAME) };
+static const char *netlog_int_fields[] = { NETLOG_REQUEST_INT_FIELDS(NETLOG_FIELD_NAME) };
+#undef NETLOG_FIELD_NAME
+
+#define NETLOG_MAX_VALUE_LENGTH 4096
+#define NETLOG_MAX_HISTORY_LENGTH 16384
+
+typedef struct {
+    int64_t id;
+    bool request;
+    bool closed;
+    bool truncated;
+    char *strings[G_N_ELEMENTS(netlog_string_fields)];
+    int64_t integers[G_N_ELEMENTS(netlog_int_fields)];
+    bool have_integer[G_N_ELEMENTS(netlog_int_fields)];
+    GPtrArray *parents; /* Borrowed NetLogContext pointers: users of this source. */
+    GPtrArray *history; /* JSON change records, in event order. */
+    size_t history_length;
+} NetLogContext;
+
+/* Unlike json_get_string/json_get_int these helpers do not modify filebuf:
+ * the transport reader still needs to parse it after the metadata pass. */
+static jsmntok_t *
+netlog_member(const char *buf, jsmntok_t *object, const char *name)
+{
+    if (!object || object->type != JSMN_OBJECT)
+        return NULL;
+    jsmntok_t *key = object + 1;
+    for (int i = 0; i < object->size; i++, key = json_get_next_object(key)) {
+        if (key->type == JSMN_STRING && key->size == 1 &&
+            (size_t)(key->end - key->start) == strlen(name) &&
+            memcmp(buf + key->start, name, strlen(name)) == 0)
+            return key + 1;
+    }
+    return NULL;
+}
+
+static char *
+netlog_string(const char *buf, jsmntok_t *token)
+{
+    if (!token || token->type != JSMN_STRING)
+        return NULL;
+    char *value = g_strndup(buf + token->start, token->end - token->start);
+    if (!json_decode_string_inplace(value)) {
+        g_free(value);
+        return NULL;
+    }
+    return value;
+}
+
+static bool
+netlog_integer(const char *buf, jsmntok_t *token, int64_t *value)
+{
+    if (!token || token->type != JSMN_PRIMITIVE || token->end <= token->start)
+        return false;
+    char *end;
+    errno = 0;
+    *value = g_ascii_strtoll(buf + token->start, &end, 10);
+    bool valid = errno == 0 && end == buf + token->end;
+    errno = 0;
+    return valid;
+}
+
+static void
+netlog_context_free(void *data)
+{
+    NetLogContext *context = data;
+    for (unsigned i = 0; i < G_N_ELEMENTS(context->strings); i++)
+        g_free(context->strings[i]);
+    g_ptr_array_unref(context->parents);
+    g_ptr_array_unref(context->history);
+    g_free(context);
+}
+
+static NetLogContext *
+netlog_context(GHashTable *contexts, int64_t id)
+{
+    NetLogContext *context = g_hash_table_lookup(contexts, &id);
+    if (!context) {
+        context = g_new0(NetLogContext, 1);
+        context->id = id;
+        context->parents = g_ptr_array_new();
+        context->history = g_ptr_array_new_with_free_func(g_free);
+        g_hash_table_insert(contexts, &context->id, context);
+    }
+    return context;
+}
+
+static GHashTable *
+netlog_constant_names(const char *buf, jsmntok_t *constants, const char *name)
+{
+    GHashTable *names = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+    jsmntok_t *object = netlog_member(buf, constants, name);
+    if (object && object->type == JSMN_OBJECT) {
+        jsmntok_t *key = object + 1;
+        for (int i = 0; i < object->size; i++, key = json_get_next_object(key)) {
+            int64_t value;
+            if (key->size == 1 && netlog_integer(buf, key + 1, &value)) {
+                int64_t *id = g_new(int64_t, 1);
+                *id = value;
+                g_hash_table_replace(names, id, netlog_string(buf, key));
+            }
+        }
+    }
+    return names;
+}
+
+static void
+netlog_json_integer(json_dumper *dumper, const char *name, int64_t value)
+{
+    json_dumper_set_member_name(dumper, name);
+    json_dumper_value_anyf(dumper, "%" PRId64, value);
+}
+
+static void
+netlog_update_context(NetLogContext *context, const char *buf, jsmntok_t *event,
+                      jsmntok_t *params, const char *event_name, int event_index)
+{
+    GString *change = g_string_new(NULL);
+    json_dumper dumper = { .output_string = change };
+    bool changed = false;
+    json_dumper_begin_object(&dumper);
+    netlog_json_integer(&dumper, "event_index", event_index);
+    json_dumper_set_member_name(&dumper, "event");
+    json_dumper_value_string(&dumper, event_name);
+    char *event_time = netlog_string(buf, netlog_member(buf, event, "time"));
+    if (event_time) {
+        json_dumper_set_member_name(&dumper, "time");
+        json_dumper_value_string(&dumper, event_time);
+        g_free(event_time);
+    }
+    int64_t phase;
+    if (netlog_integer(buf, netlog_member(buf, event, "phase"), &phase))
+        netlog_json_integer(&dumper, "phase", phase);
+    for (unsigned i = 0; i < G_N_ELEMENTS(netlog_string_fields); i++) {
+        const char *name = netlog_string_fields[i];
+        /* Non-request sources only contribute their own anonymization key. */
+        if (!context->request && strcmp(name, "network_anonymization_key") != 0)
+            continue;
+        char *value = netlog_string(buf, netlog_member(buf, params, name));
+        if (!value)
+            continue;
+        if (strlen(value) > NETLOG_MAX_VALUE_LENGTH) {
+            context->truncated = true;
+            g_clear_pointer(&context->strings[i], g_free);
+            g_free(value);
+            continue;
+        }
+        if (g_strcmp0(value, context->strings[i]) != 0) {
+            g_free(context->strings[i]);
+            context->strings[i] = value;
+            json_dumper_set_member_name(&dumper, name);
+            json_dumper_value_string(&dumper, value);
+            changed = true;
+        } else {
+            g_free(value);
+        }
+    }
+    if (context->request) {
+        for (unsigned i = 0; i < G_N_ELEMENTS(netlog_int_fields); i++) {
+            int64_t value;
+            if (netlog_integer(buf, netlog_member(buf, params, netlog_int_fields[i]), &value) &&
+                (!context->have_integer[i] || context->integers[i] != value)) {
+                context->have_integer[i] = true;
+                context->integers[i] = value;
+                netlog_json_integer(&dumper, netlog_int_fields[i], value);
+                changed = true;
+            }
+        }
+    }
+    json_dumper_end_object(&dumper);
+    json_dumper_finish(&dumper);
+    if (changed && context->request) {
+        if (context->history_length + change->len <= NETLOG_MAX_HISTORY_LENGTH) {
+            context->history_length += change->len;
+            g_ptr_array_add(context->history, g_string_free(change, false));
+            return;
+        }
+        context->truncated = true;
+    }
+    g_string_free(change, true);
+}
+
+/* Direction is owner -> dependency. Deliberately whitelist bindings instead
+ * of walking arbitrary source_dependency edges through unrelated requests. */
+static void
+netlog_bind_context(NetLogContext *source, NetLogContext *dependency, const char *event)
+{
+    static const char *forward[] = {
+        "HTTP_STREAM_REQUEST_BOUND_TO_JOB", "HTTP_STREAM_REQUEST_BOUND_TO_QUIC_SESSION",
+        "SOCKET_POOL_BOUND_TO_SOCKET", "SOCKET_POOL_BOUND_TO_CONNECT_JOB",
+        "HTTP2_SESSION_POOL_FOUND_EXISTING_SESSION", "HTTP2_SESSION_POOL_IMPORTED_SESSION_FROM_SOCKET",
+        "QUIC_SESSION_POOL_USE_EXISTING_SESSION", "BOUND_TO_QUIC_SESSION_POOL_JOB",
+        "HTTP2_SESSION_INITIALIZED", "CONNECT_JOB_SET_SOCKET",
+        "TRANSPORT_CONNECT_JOB_CONNECT_ATTEMPT", "QUIC_SESSION"
+    };
+    static const char *reverse[] = {
+        "HTTP_STREAM_JOB_BOUND_TO_REQUEST", "HTTP2_SESSION_SEND_HEADERS",
+        "QUIC_SESSION_POOL_ATTACH_HTTP_STREAM_JOB_TO_EXISTING_SESSION",
+        "SOCKET_IN_USE", "SOCKET_ALIVE"
+    };
+    NetLogContext *owner = NULL, *child = NULL;
+    for (unsigned i = 0; i < G_N_ELEMENTS(forward); i++) {
+        if (strcmp(event, forward[i]) == 0) {
+            owner = source;
+            child = dependency;
+            break;
+        }
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(reverse); i++) {
+        if (strcmp(event, reverse[i]) == 0) {
+            owner = dependency;
+            child = source;
+            break;
+        }
+    }
+    if (!owner || owner == child)
+        return;
+    for (unsigned i = 0; i < child->parents->len; i++) {
+        if (g_ptr_array_index(child->parents, i) == owner)
+            return;
+    }
+    g_ptr_array_add(child->parents, owner);
+}
+
+static const char *
+netlog_context_nak(const NetLogContext *context)
+{
+    for (unsigned i = 0; i < G_N_ELEMENTS(netlog_string_fields); i++) {
+        if (strcmp(netlog_string_fields[i], "network_anonymization_key") == 0)
+            return context->strings[i];
+    }
+    return NULL;
+}
+
+static GBytes *
+netlog_request_snapshot(NetLogContext *request, int64_t transport_id,
+                        NetLogContext *nak_source, GHashTable *snapshots)
+{
+    GString *option = g_string_new(NETLOG_REQUEST_OPTION_PREFIX);
+    json_dumper dumper = { .output_string = option };
+    /* Allow for JSON escaping (at most six bytes per input byte), the
+     * history, member names and numeric fields within the pcapng limit. */
+    size_t value_budget = UINT16_MAX - 4 - request->history_length - 2048;
+    bool truncated = request->truncated;
+    json_dumper_begin_object(&dumper);
+    netlog_json_integer(&dumper, "source_id", request->id);
+    netlog_json_integer(&dumper, "transport_source_id", transport_id);
+    for (unsigned i = 0; i < G_N_ELEMENTS(netlog_string_fields); i++) {
+        if (request->strings[i]) {
+            size_t cost = 6 * strlen(request->strings[i]);
+            if (cost > value_budget) {
+                truncated = true;
+                continue;
+            }
+            value_budget -= cost;
+            json_dumper_set_member_name(&dumper, netlog_string_fields[i]);
+            json_dumper_value_string(&dumper, request->strings[i]);
+        }
+    }
+    if (!netlog_context_nak(request) && nak_source &&
+        6 * strlen(netlog_context_nak(nak_source)) <= value_budget) {
+        json_dumper_set_member_name(&dumper, "network_anonymization_key");
+        json_dumper_value_string(&dumper, netlog_context_nak(nak_source));
+        netlog_json_integer(&dumper, "nak_source_id", nak_source->id);
+    } else if (!netlog_context_nak(request) && nak_source) {
+        truncated = true;
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(netlog_int_fields); i++) {
+        if (request->have_integer[i])
+            netlog_json_integer(&dumper, netlog_int_fields[i], request->integers[i]);
+    }
+    json_dumper_set_member_name(&dumper, "history");
+    json_dumper_begin_array(&dumper);
+    for (unsigned i = 0; i < request->history->len; i++)
+        json_dumper_value_anyf(&dumper, "%s", (char *)g_ptr_array_index(request->history, i));
+    json_dumper_end_array(&dumper);
+    if (truncated) {
+        json_dumper_set_member_name(&dumper, "truncated");
+        json_dumper_value_anyf(&dumper, "true");
+    }
+    json_dumper_end_object(&dumper);
+    json_dumper_finish(&dumper);
+    /* The pcapng option length is 16 bits and includes the four-byte PEN. */
+    if (option->len > UINT16_MAX - 4) {
+        g_string_free(option, true);
+        return NULL;
+    }
+    GBytes *bytes = g_hash_table_lookup(snapshots, option->str);
+    if (!bytes) {
+        size_t size = option->len + 1;
+        char *value = g_string_free(option, false);
+        bytes = g_bytes_new_take(value, size);
+        g_hash_table_insert(snapshots, value, bytes);
+    } else {
+        g_string_free(option, true);
+    }
+    return g_bytes_ref(bytes);
+}
+
+static GPtrArray *
+netlog_ancestors(NetLogContext *start)
+{
+    GPtrArray *queue = g_ptr_array_new();
+    GHashTable *visited = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_ptr_array_add(queue, start);
+    g_hash_table_add(visited, start);
+    for (unsigned i = 0; i < queue->len; i++) {
+        NetLogContext *context = g_ptr_array_index(queue, i);
+        if (context->closed || context->request)
+            continue;
+        for (unsigned j = 0; j < context->parents->len; j++) {
+            NetLogContext *parent = g_ptr_array_index(context->parents, j);
+            if (g_hash_table_add(visited, parent))
+                g_ptr_array_add(queue, parent);
+        }
+    }
+    g_hash_table_destroy(visited);
+    return queue;
+}
+
+static GPtrArray *
+netlog_related_requests(NetLogContext *transport, GHashTable *snapshots)
+{
+    GPtrArray *queue = netlog_ancestors(transport);
+    GPtrArray *requests = g_ptr_array_new();
+    GPtrArray *options = g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+    for (unsigned i = 0; i < queue->len; i++) {
+        NetLogContext *context = g_ptr_array_index(queue, i);
+        if (context->closed)
+            continue;
+        if (context->request) {
+            g_ptr_array_add(requests, context);
+            continue; /* Never cross a request into another request's sources. */
+        }
+    }
+    for (unsigned i = 0; i < requests->len; i++) {
+        NetLogContext *request = g_ptr_array_index(requests, i);
+        NetLogContext *nak_source = NULL;
+        bool ambiguous_nak = false;
+        for (unsigned j = 0; j < queue->len; j++) {
+            NetLogContext *candidate = g_ptr_array_index(queue, j);
+            if (candidate->request || candidate->closed || !netlog_context_nak(candidate))
+                continue;
+            /* A key must be on this request's path to the transport, not on
+             * another branch that happens to use the same transport. */
+            GPtrArray *ancestors = netlog_ancestors(candidate);
+            for (unsigned k = 0; k < ancestors->len; k++) {
+                if (g_ptr_array_index(ancestors, k) == request) {
+                    if (nak_source && strcmp(netlog_context_nak(candidate), netlog_context_nak(nak_source)) != 0)
+                        ambiguous_nak = true;
+                    nak_source = candidate;
+                    break;
+                }
+            }
+            g_ptr_array_unref(ancestors);
+        }
+        GBytes *snapshot = netlog_request_snapshot(request,
+            transport->id, ambiguous_nak ? NULL : nak_source, snapshots);
+        if (snapshot)
+            g_ptr_array_add(options, snapshot);
+    }
+    g_ptr_array_unref(queue);
+    g_ptr_array_unref(requests);
+    return options;
+}
+
+static GHashTable *
+netlog_parse_metadata(const char *buf, jsmntok_t *root, jsmntok_t *events)
+{
+    GHashTable *contexts = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, netlog_context_free);
+    GHashTable *snapshots = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, (GDestroyNotify)g_bytes_unref);
+    GHashTable *packets = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, (GDestroyNotify)g_ptr_array_unref);
+    jsmntok_t *constants = netlog_member(buf, root, "constants");
+    GHashTable *names = netlog_constant_names(buf, constants, "logEventTypes");
+    GHashTable *types = netlog_constant_names(buf, constants, "logSourceType");
+    int64_t end_phase = -1;
+    netlog_integer(buf, netlog_member(buf, netlog_member(buf, constants, "logEventPhase"), "PHASE_END"), &end_phase);
+    jsmntok_t *event = json_get_array_index(events, 0);
+    for (int i = 0; i < events->size; i++, event = json_get_next_object(event)) {
+        int64_t id, type, source_type, phase;
+        jsmntok_t *source = netlog_member(buf, event, "source");
+        if (!netlog_integer(buf, netlog_member(buf, source, "id"), &id) || id < 0 ||
+            !netlog_integer(buf, netlog_member(buf, event, "type"), &type))
+            continue;
+        const char *name = g_hash_table_lookup(names, &type);
+        if (!name)
+            continue;
+        NetLogContext *context = netlog_context(contexts, id);
+        const char *type_name = NULL;
+        if (netlog_integer(buf, netlog_member(buf, source, "type"), &source_type))
+            type_name = g_hash_table_lookup(types, &source_type);
+        if (g_strcmp0(type_name, "URL_REQUEST") == 0 || strcmp(name, "REQUEST_ALIVE") == 0 ||
+            strcmp(name, "URL_REQUEST_START_JOB") == 0)
+            context->request = true;
+        jsmntok_t *params = netlog_member(buf, event, "params");
+        if (context->request && strcmp(name, "URL_REQUEST_START_JOB") == 0 &&
+            (netlog_member(buf, params, "url") || netlog_member(buf, params, "method"))) {
+            /* A redirect/restart can bind the same URL_REQUEST to a new job.
+             * Retain attribute history, but retire the previous job bindings. */
+            GHashTableIter iter;
+            void *value;
+            g_hash_table_iter_init(&iter, contexts);
+            while (g_hash_table_iter_next(&iter, NULL, &value)) {
+                NetLogContext *other = value;
+                g_ptr_array_remove(other->parents, context);
+            }
+        }
+        netlog_update_context(context, buf, event, params, name, i);
+        if (strcmp(name, "REQUEST_ALIVE") == 0 && end_phase >= 0 &&
+            netlog_integer(buf, netlog_member(buf, event, "phase"), &phase) && phase == end_phase)
+            context->closed = true;
+        jsmntok_t *dependency = netlog_member(buf, params, "source_dependency");
+        int64_t dependency_id;
+        if (netlog_integer(buf, netlog_member(buf, dependency, "id"), &dependency_id) && dependency_id >= 0)
+            netlog_bind_context(context, netlog_context(contexts, dependency_id), name);
+        if (params && (strcmp(name, "SOCKET_BYTES_SENT") == 0 || strcmp(name, "SOCKET_BYTES_RECEIVED") == 0 ||
+            strcmp(name, "SSL_SOCKET_BYTES_SENT") == 0 || strcmp(name, "SSL_SOCKET_BYTES_RECEIVED") == 0 ||
+            strcmp(name, "UDP_BYTES_SENT") == 0 || strcmp(name, "UDP_BYTES_RECEIVED") == 0)) {
+            GPtrArray *options = netlog_related_requests(context, snapshots);
+            if (options->len)
+                g_hash_table_insert(packets, GINT_TO_POINTER(params->start), options);
+            else
+                g_ptr_array_unref(options);
+        }
+    }
+    g_hash_table_destroy(types);
+    g_hash_table_destroy(names);
+    g_hash_table_destroy(snapshots);
+    g_hash_table_destroy(contexts);
+    return packets;
+}
+
+static void
+netlog_packet_free(void *data)
+{
+    JSONPacket *packet = data;
+    if (packet->request_options)
+        g_ptr_array_unref(packet->request_options);
+    g_free(packet);
+}
+
 /**
  * Parses the entire NetLog JSON file from `fh` and stores the packets in json_packets_ht.
  * Returns true on success, false on failure.
@@ -833,11 +1294,24 @@ static bool netlog_parse_entirety(wtap *wth, FILE_T fh, int *err, char **err_inf
         return false;
     }
 
+    GHashTable *metadata = netlog_parse_metadata((const char *)filebuf, root_json_token, json_events);
     if (!parse_json_events((char*)filebuf, netlog_event_constants, json_events, json_packets_ht)){
+        g_hash_table_destroy(metadata);
         g_free(json_tokens);
         g_free(filebuf);
         return false;
     }
+
+    GHashTableIter packet_iter;
+    void *packet_value;
+    g_hash_table_iter_init(&packet_iter, json_packets_ht);
+    while (g_hash_table_iter_next(&packet_iter, NULL, &packet_value)) {
+        JSONPacket *packet = packet_value;
+        GPtrArray *options = g_hash_table_lookup(metadata, GUINT_TO_POINTER(packet->offset));
+        if (options)
+            packet->request_options = g_ptr_array_ref(options);
+    }
+    g_hash_table_destroy(metadata);
 
     if (g_hash_table_size(json_packets_ht) == 0){
         /* Might be a NetLog capture without any data. Skip it so it can be parsed by the JSON parser. */
@@ -904,7 +1378,7 @@ wtap_open_return_val netlog_open(wtap* wth, int* err, char** err_info)
         return WTAP_OPEN_ERROR;
     }
     /* Mapping of 'offset' (index) to json data */
-    netlog_state->json_packets_ht = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    netlog_state->json_packets_ht = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, netlog_packet_free);
     /* Parse and store the packets for future use: */
     if (!netlog_parse_entirety(wth, wth->fh, err, err_info, netlog_state->json_packets_ht)) {
         g_hash_table_destroy(netlog_state->json_packets_ht);
@@ -929,9 +1403,12 @@ wtap_open_return_val netlog_open(wtap* wth, int* err, char** err_info)
     return WTAP_OPEN_MINE;
 }
 
+static const struct supported_option_type netlog_packet_options_supported[] = {
+    { OPT_CUSTOM_STR_COPY, MULTIPLE_OPTIONS_SUPPORTED }
+};
+
 static const struct supported_block_type netlog_blocks_supported[] = {
-    /* We support packet blocks, with no comments or other options. */
-    { WTAP_BLOCK_PACKET, ONE_BLOCK_SUPPORTED, NO_OPTIONS_SUPPORTED }
+    { WTAP_BLOCK_PACKET, ONE_BLOCK_SUPPORTED, OPTION_TYPES_SUPPORTED(netlog_packet_options_supported) }
 };
 
 static const struct file_type_subtype_info netlog_info = {

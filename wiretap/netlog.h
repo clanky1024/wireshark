@@ -11,6 +11,26 @@
 
 #include "wtap.h"
 
+/* Copyable pcapng custom string option, using PEN_WIRESHARK. The prefix
+ * identifies the schema independently of other options using that PEN.
+ * Each option is a snapshot of one related URL_REQUEST, not byte ownership.
+ */
+#define NETLOG_REQUEST_OPTION_PREFIX "netlog.request.v1:"
+
+#define NETLOG_REQUEST_STRING_FIELDS(X) \
+    X(url, "URL") \
+    X(method, "Method") \
+    X(initiator, "Initiator") \
+    X(request_type, "Request type") \
+    X(site_for_cookies, "Site for cookies") \
+    X(priority, "Priority") \
+    X(network_isolation_key, "Network isolation key") \
+    X(network_anonymization_key, "Network anonymization key")
+
+#define NETLOG_REQUEST_INT_FIELDS(X) \
+    X(load_flags, "Load flags") \
+    X(upload_id, "Upload ID")
+
 /**
  * @brief Open a NetLog file for reading.
  *
