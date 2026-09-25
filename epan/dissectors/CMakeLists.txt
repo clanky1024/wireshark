@@ -1329,6 +1329,7 @@ set(DISSECTOR_SRC
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-netdump.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-netgear-ensemble.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-netflow.c
+	${CMAKE_CURRENT_SOURCE_DIR}/packet-netlog.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-netlink-generic.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-netlink-netfilter.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-netlink-net_dm.c
