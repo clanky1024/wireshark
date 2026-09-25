@@ -1250,7 +1250,9 @@ dissect_frame(tvbuff_t *tvb, packet_info *pinfo, proto_tree *parent_tree, void* 
 
 	cb_data.pinfo = pinfo;
 	cb_data.tvb = tvb;
-	cb_data.tree = fh_tree;
+	/* A custom-option protocol may be referenced even when no frame field is
+	 * requested (e.g. tshark -T fields -e netlog.request.initiator). */
+	cb_data.tree = fh_tree != NULL ? fh_tree : tree;
 	cb_data.data.optval = NULL;
 	wtap_block_foreach_option(fr_data->pkt_block,
 	    handle_packet_option, &cb_data);
